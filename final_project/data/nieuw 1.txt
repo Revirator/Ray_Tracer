@@ -1,0 +1,335 @@
+#include "bounding_volume_hierarchy.h"
+#include "draw.h"
+#include <framework/disable_all_warnings.h>
+DISABLE_WARNINGS_PUSH()
+#include <glm/geometric.hpp>
+#include <glm/gtx/component_wise.hpp>
+#include <glm/vector_relational.hpp>
+DISABLE_WARNINGS_POP()
+#include <cmath>
+#include <iostream>
+#include <limits>
+
+Scene* scene;
+int axis;
+
+// Class of self made comparator, which compares two vector<int>'s
+// where the value at index 0 is the mesh index, and the value at index 1 is the triangle index inside that mesh
+class compare {
+public:
+    bool operator()(const std::vector<int>& i,const std::vector<int>& j) {
+        std::vector<float> leftCentroid;
+        std::vector<float> rightCentroid;
+
+        // get mesh index of first triangle
+        int meshi = i[0];
+        // get mesh index of second triangle
+        int meshj = j[0];
+        // get triangle index of first triangle
+        int indexi = i[1];
+        // get triangle index of second triangle
+        int indexj = j[1];
+
+        leftCentroid.push_back((scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).x).position.x + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).y).position.x + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).z).position.x) / 3.0f);
+        leftCentroid.push_back((scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).x).position.y + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).y).position.y + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).z).position.y) / 3.0f);
+        leftCentroid.push_back((scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).x).position.z + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).y).position.z + scene->meshes.at(meshi).vertices.at(scene->meshes.at(meshi).triangles.at(indexi).z).position.z) / 3.0f);
+
+        rightCentroid.push_back((scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).x).position.x + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).y).position.x + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).z).position.x) / 3.0f);
+        rightCentroid.push_back((scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).x).position.y + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).y).position.y + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).z).position.y) / 3.0f);
+        rightCentroid.push_back((scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).x).position.z + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).y).position.z + scene->meshes.at(meshj).vertices.at(scene->meshes.at(meshj).triangles.at(indexj).z).position.z) / 3.0f);
+        
+        // compare on the coordinate of the triangles's centroid, variable 'axis' determines which coordinate to look at.
+        if (leftCentroid[axis] < rightCentroid[axis]) {
+            return true;
+        }
+        return false;
+    }
+};
+// all the nodes in the bvh tree stored in a vector, 
+// for each parent at index a, it holds that left and right children have indices 2*a + 1 and 2*a + 2 respectfully
+std::vector<BoundingVolumeHierarchy::Node> nodes; 
+int depth_BVH; // keep track of depth of tree
+
+// takes a vector of triangle indices and returns the aabb that wraps around those triangles
+AxisAlignedBox getBox(std::vector<std::vector<int>> indices) {
+    float lowx = INT_MAX;
+    float lowy = INT_MAX;
+    float lowz = INT_MAX;
+    float upx = INT_MIN;
+    float upy = INT_MIN;
+    float upz = INT_MIN;
+    AxisAlignedBox box;
+
+    // loop through all indices
+    for (std::vector<int> i : indices) {
+
+        int mesh = i[0]; // get the mesh index
+        int index = i[1]; // and get triangle index
+
+        // get the corner vertices of the triangle
+        Vertex v0 = scene->meshes.at(mesh).vertices.at(scene->meshes.at(mesh).triangles.at(index).x);
+        Vertex v1 = scene->meshes.at(mesh).vertices.at(scene->meshes.at(mesh).triangles.at(index).y);
+        Vertex v2 = scene->meshes.at(mesh).vertices.at(scene->meshes.at(mesh).triangles.at(index).z);
+        
+        // compare all coordinates, to get both the lowest and highest value of all triangles in the loop
+        lowx = std::fminf(std::fminf(std::fminf(v1.position.x, v0.position.x), v2.position.x), lowx);
+        lowy = std::fminf(std::fminf(std::fminf(v1.position.y, v0.position.y), v2.position.y), lowy);
+        lowz = std::fminf(std::fminf(std::fminf(v1.position.z, v0.position.z), v1.position.z), lowz);
+        upx = std::fmaxf(std::fmaxf(std::fmaxf(v1.position.x, v0.position.x), v2.position.x), upx);
+        upy = std::fmaxf(std::fmaxf(std::fmaxf(v1.position.y, v0.position.y), v2.position.y), upy);
+        upz = std::fmaxf(std::fmaxf(std::fmaxf(v1.position.z, v0.position.z), v2.position.z), upz);
+    }
+    return { glm::vec3(lowx, lowy, lowz), glm::vec3(upx, upy, upz) };
+}
+// recursively builds the tree, param node is the 'current node', level is the level of the current node, 
+// indices is a vector that holds indices for both the mesh and the triangle, per triangle that is present in the current node's box.
+// Indices is already sorted on triangle centroids, with looking at the right axis belonging to current node's level.
+void buildBVH(BoundingVolumeHierarchy::Node node, int level, std::vector<std::vector<int>> indices) {
+
+    // make sure we remember the biggest level
+    if (level > depth_BVH) {
+        depth_BVH = level;
+    }
+
+    // if indices.size() > 1, current node is not a leaf, so we create children and call this method again for both children.
+    if (indices.size() > 1) {
+
+        // make current node.indices point to the indices that its children will get
+        std::vector<int> vector1;
+        vector1.push_back(nodes.size() * 2 + 1);
+        std::vector<int> vector2;
+        vector2.push_back(nodes.size() * 2 + 2);
+        node.indices.push_back(vector1);
+        node.indices.push_back(vector2);
+
+        // set isLeaf to false
+        node.isLeaf = false;
+
+        // push current node at 'nodes'
+        nodes.push_back(node);
+
+        // create both children
+        BoundingVolumeHierarchy::Node child1;
+        BoundingVolumeHierarchy::Node child2;
+        child1.level = level + 1;
+        child2.level = level + 1;
+
+        // create a new vector of indices for each child, to use as a parameter for the childs's call of this method
+        std::vector<std::vector<int>> indices1;
+        std::vector<std::vector<int>> indices2;
+
+        // since 'indices' was already sorted properly, we can put the left half into indices1, and else into indices2
+        float split = indices.size() / 2.0f;
+        for (int i = 0; i < indices.size(); i++) {
+            if (i < split) {
+                indices1.push_back(indices.at(i));
+            }
+            else {
+                indices2.push_back(indices.at(i));
+            }
+        }
+        // get the correct axisAlignedBox for both children
+        child1.box = getBox(indices1);
+        child2.box = getBox(indices2);
+
+        // get comparator
+        compare c;
+
+        // axis alternates, so set new axis
+        axis = (level + 1) % 3;
+
+        // sort both indices1 and indices2
+        std::sort(indices1.begin(), indices1.end(), c);
+        std::sort(indices2.begin(), indices2.end(), c);
+
+        // recursively repeat for both children
+        buildBVH(child1, level + 1, indices1);
+        buildBVH(child2, level + 1, indices2);
+    }
+    // We have only one triangle in the box, so the current node is a leaf node
+    else {
+        node.isLeaf = true;
+        node.box = getBox(indices);
+        node.indices = indices;
+        nodes.push_back(node);
+    }
+}
+
+BoundingVolumeHierarchy::BoundingVolumeHierarchy(Scene* pScene)
+    : m_pScene(pScene)
+{
+    scene = pScene;
+    nodes = {};
+    if (!pScene->meshes.empty()) {
+        Node root;
+        root.level = 0;
+        depth_BVH = 0;
+        int mesh = 0;
+        std::vector<std::vector<int>> indices;
+        for (Mesh m : pScene->meshes) {
+            for (int i = 0; i < m.triangles.size(); i++) {
+                std::vector<int> vector = { mesh, i };
+                indices.push_back(vector);
+            }
+            mesh++;
+        }
+        root.box = getBox(indices);
+        axis = 0;
+        compare c;
+        std::sort(indices.begin(), indices.end(), c);
+        buildBVH(root, 0, indices);
+    }
+}
+
+// Return the depth of the tree that you constructed. This is used to tell the
+// slider in the UI how many steps it should display.
+int BoundingVolumeHierarchy::numLevels() const
+{
+    return depth_BVH + 1;
+}
+
+// Use this function to visualize your BVH. This can be useful for debugging. Use the functions in
+// draw.h to draw the various shapes. We have extended the AABB draw functions to support wireframe
+// mode, arbitrary colors and transparency.
+void BoundingVolumeHierarchy::debugDraw(int level)
+{            
+    // Draw the AABB as a transparent green box.
+    //AxisAlignedBox aabb{ glm::vec3(-0.05f), glm::vec3(0.05f, 1.05f, 1.05f) };
+    //drawShape(aabb, DrawMode::Filled, glm::vec3(0.0f, 1.0f, 0.0f), 0.2f);
+    for (BoundingVolumeHierarchy::Node node : nodes) {
+        if (node.level == level) {
+            drawAABB(node.box, DrawMode::Wireframe, glm::vec3(0.05f, 1.0f, 0.05f), 1);
+        }
+    }
+}
+
+
+// Return true if something is hit, returns false otherwise. Only find hits if they are closer than t stored
+// in the ray and if the intersection is on the correct side of the origin (the new t >= 0). Replace the code
+// by a bounding volume hierarchy acceleration structure as described in the assignment. You can change any
+// file you like, including bounding_volume_hierarchy.h .
+bool BoundingVolumeHierarchy::intersect(Ray& ray, HitInfo& hitInfo) const
+{
+    bool hit = false;
+    // Intersect with all triangles of all meshes.
+    for (const auto& mesh : m_pScene->meshes) {
+        for (const auto& tri : mesh.triangles) {
+            const auto v0 = mesh.vertices[tri[0]];
+            const auto v1 = mesh.vertices[tri[1]];
+            const auto v2 = mesh.vertices[tri[2]];
+            if (intersectRayWithTriangle(v0, v1, v2, ray, hitInfo)) {
+                hitInfo.material = mesh.material;
+                hit = true;
+            }
+        }
+    }
+    // Intersect with spheres.
+    for (const auto& sphere : m_pScene->spheres)
+        hit |= intersectRayWithShape(sphere, ray, hitInfo);
+    return hit;
+}
+
+void BoundingVolumeHierarchy::loadVertexNormals() const {
+    for (auto& mesh : m_pScene->meshes) {
+        for (size_t i = 0; i < mesh.vertices.size(); i++) {
+            glm::vec3 vertexNormals(0.0f);
+            Vertex& v = mesh.vertices[i];
+            for (const auto& tri : mesh.triangles) {
+                const glm::vec3 v0 = mesh.vertices[tri[0]].position;
+                const glm::vec3 v1 = mesh.vertices[tri[1]].position;
+                const glm::vec3 v2 = mesh.vertices[tri[2]].position;
+                if (v0 == v.position || v1 == v.position || v2 == v.position)
+                {
+                    vertexNormals += glm::normalize(glm::cross(v1 - v0, v2 - v0));
+                }
+            };
+            v.normal = glm::normalize(vertexNormals);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#pragma once
+#include "ray_tracing.h"
+#include "scene.h"
+#include <array>
+#include <span>
+
+class BoundingVolumeHierarchy {
+public:
+    BoundingVolumeHierarchy(Scene* pScene);
+
+    // Implement these two functions for the Visual Debug.
+    // The first function should return how many levels there are in the tree that you have constructed.
+    // The second function should draw the bounding boxes of the nodes at the selected level.
+    int numLevels() const;
+    void debugDraw(int level);
+
+    // Return true if something is hit, returns false otherwise.
+    // Only find hits if they are closer than t stored in the ray and the intersection
+    // is on the correct side of the origin (the new t >= 0).
+    bool intersect(Ray& ray, HitInfo& hitInfo) const;
+
+
+    struct Node {
+        // boolean that specifies whether the node is a leaf or not
+        bool isLeaf;
+
+        // When a node is a leaf, the vector 'indices' will correspond to a single triangle, 
+        // such that indices[0][0] contains the index of the belonging mesh in scene.meshes, 
+        // and indices[0][1] contains the index of the triangle in that mesh.
+        // In case of a non-leaf node, indices will 'point' to the node's children,
+        // such that indices[0][0] will contain the index of the left child in vector 'nodes',
+        // and indices[1][0] will contain the index of the right child in vector 'nodes'.
+        std::vector<std::vector<int>> indices;
+
+        // this is the AxisAlignedBox that is fully filled with all the triangles of the leafs of the node's subtree
+        AxisAlignedBox box;
+
+        // the level of the node inside the tree hierarchy, i.e. root is level 0, his children are level 1, etc.
+        int level;
+    };
+
+    void loadVertexNormals() const;
+
+private:
+    Scene* m_pScene;
+};
